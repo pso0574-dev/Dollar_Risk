@@ -2,10 +2,12 @@
 # ============================================================
 # QQQ / SPY Phase Buying Strategy Dashboard
 # ------------------------------------------------------------
-# Fixes:
-#   - Removed risky style.format() usage on mixed-type columns
-#   - Added safe display formatting helpers
-#   - Keeps phase-based QQQ / SPY option strategy
+# Fixes in this version:
+#   - Fixed empty explanation boxes
+#   - Replaced fragile HTML wrapper + Streamlit markdown mixing
+#   - "Why the system is cautious" and "What to watch next"
+#     now always render visibly inside proper containers
+#   - Kept safe dataframe rendering without style.format()
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -158,12 +160,29 @@ st.markdown("""
     margin-bottom: 0.8rem;
 }
 
-.list-box {
+.info-box {
     border: 1px solid rgba(128,128,128,0.25);
     border-radius: 14px;
-    padding: 14px;
+    padding: 14px 16px;
     background: rgba(255,255,255,0.02);
-    min-height: 260px;
+    min-height: 280px;
+    margin-bottom: 10px;
+}
+
+.info-box h4 {
+    margin-top: 0.1rem;
+    margin-bottom: 0.8rem;
+    font-size: 1rem;
+}
+
+.info-box ul {
+    margin-top: 0.2rem;
+    padding-left: 1.2rem;
+}
+
+.info-box li {
+    margin-bottom: 0.45rem;
+    line-height: 1.4;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -438,6 +457,19 @@ def render_signal_card(title: str, status: str, value: str, sub_value: str, comm
     )
 
 
+def render_info_box(title: str, items: List[str], empty_text: str) -> None:
+    html = [f'<div class="info-box"><h4>{title}</h4>']
+    if items:
+        html.append("<ul>")
+        for item in items:
+            html.append(f"<li>{item}</li>")
+        html.append("</ul>")
+    else:
+        html.append(f"<div>{empty_text}</div>")
+    html.append("</div>")
+    st.markdown("".join(html), unsafe_allow_html=True)
+
+
 def strategy_profile_map(profile: str) -> Dict[str, Dict[str, int]]:
     if profile == "Conservative":
         return {
@@ -513,7 +545,15 @@ def build_action_items(signals: List[SignalResult], fast_ma: int, slow_ma: int, 
     out = []
     for s in signals:
         if s.score < 1.0:
-            out.append(f"**{s.label}** — {mapping.get(s.label, 'Needs improvement')}")
+            out.append(f"<b>{s.label}</b> — {mapping.get(s.label, 'Needs improvement')}")
+    return out[:6]
+
+
+def build_weak_items(signals: List[SignalResult]) -> List[str]:
+    out = []
+    for s in signals:
+        if s.score == 0.0:
+            out.append(f"<b>{s.label}</b> — {s.comment}")
     return out[:6]
 
 
@@ -857,6 +897,7 @@ current_qqq_weight = int(current_phase_row["QQQ Weight %"])
 current_spy_weight = int(current_phase_row["SPY Weight %"])
 
 watch_items = build_action_items(macro_signals + market_signals, price_ma_fast, price_ma_slow, bond_proxy)
+weak_items = build_weak_items(macro_signals + market_signals)
 
 # ------------------------------------------------------------
 # Top summary
@@ -908,27 +949,22 @@ with tab1:
         with col:
             render_signal_card(sig.label, sig.status, sig.value, sig.detail, sig.comment)
 
+    st.markdown('<div class="section-title">Why the system is cautious / What to watch next</div>', unsafe_allow_html=True)
     left, right = st.columns(2)
+
     with left:
-        st.markdown('<div class="list-box">', unsafe_allow_html=True)
-        st.markdown("#### Why the system is cautious")
-        weak_items = [f"**{s.label}** — {s.comment}" for s in (macro_signals + market_signals) if s.score == 0.0][:6]
-        if weak_items:
-            for item in weak_items:
-                st.markdown(f"- {item}")
-        else:
-            st.markdown("- No major weak signal detected.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        render_info_box(
+            "Why the system is cautious",
+            weak_items,
+            "No major weak signal detected."
+        )
 
     with right:
-        st.markdown('<div class="list-box">', unsafe_allow_html=True)
-        st.markdown("#### What to watch next")
-        if watch_items:
-            for item in watch_items:
-                st.markdown(f"- {item}")
-        else:
-            st.markdown("- No major improvement required.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        render_info_box(
+            "What to watch next",
+            watch_items,
+            "No major improvement required."
+        )
 
 # ------------------------------------------------------------
 # Tab 2: Phase Buy Plan
