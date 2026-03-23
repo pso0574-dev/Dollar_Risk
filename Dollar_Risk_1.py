@@ -1,12 +1,12 @@
 # streamlit_app.py
 # ============================================================
-# FRED + yfinance Entry Timing Dashboard
+# FRED + yfinance Entry Timing Dashboard (Improved Scoring)
 # ------------------------------------------------------------
-# Purpose:
-#   - Use FRED as a macro filter
-#   - Use yfinance as an execution trigger
-#   - Summarize current market regime
-#   - Help decide: Wait / Starter Buy / Add / Aggressive Buy
+# Improvements:
+#   - 3-level scoring: 0 / 0.5 / 1
+#   - Neutral is no longer collapsed to 0
+#   - Oil debug section added
+#   - More realistic trend thresholds
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -17,14 +17,14 @@
 # Environment:
 #   Set FRED_API_KEY in environment variables
 #   or create .streamlit/secrets.toml with:
-#       FRED_API_KEY="YOUR_FRED_API_KEY"
+#       FRED_API_KEY="YOUR_KEY"
 # ============================================================
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -70,8 +70,8 @@ YF_TICKERS = {
     "IEF": "IEF",
     "GLD": "GLD",
     "XLE": "XLE",
-    "UUP": "UUP",       # Dollar ETF proxy
-    "WTI": "CL=F",      # Crude Oil futures
+    "UUP": "UUP",
+    "WTI": "CL=F",
     "Brent": "BZ=F",
     "BTC": "BTC-USD",
     "SOXX": "SOXX",
@@ -80,7 +80,7 @@ YF_TICKERS = {
 DEFAULT_LOOKBACK_YEARS = 10
 
 # -----------------------------
-# Helpers
+# Utilities
 # -----------------------------
 def get_fred_api_key() -> Optional[str]:
     key = None
@@ -94,11 +94,7 @@ def get_fred_api_key() -> Optional[str]:
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_fred_series(
-    series_id: str,
-    api_key: str,
-    start_date: str = "2000-01-01",
-) -> pd.Series:
+def fetch_fred_series(series_id: str, api_key: str, start_date: str = "2000-01-01") -> pd.Series:
     params = {
         "series_id": series_id,
         "api_key": api_key,
@@ -120,18 +116,13 @@ def fetch_fred_series(
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["value"] = pd.to_numeric(df["value"].replace(".", np.nan), errors="coerce")
     df = df.dropna(subset=["date"]).set_index("date").sort_index()
-
     s = df["value"].astype(float)
     s.name = series_id
     return s
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_yf_close(
-    tickers: List[str],
-    period: str = "15y",
-    interval: str = "1d",
-) -> pd.DataFrame:
+def fetch_yf_close(tickers: List[str], period: str = "15y", interval: str = "1d") -> pd.DataFrame:
     df = yf.download(
         tickers=tickers,
         period=period,
@@ -145,7 +136,6 @@ def fetch_yf_close(
     if df.empty:
         return pd.DataFrame()
 
-    # Case 1: multi-index columns
     if isinstance(df.columns, pd.MultiIndex):
         close_map = {}
         for t in tickers:
@@ -159,7 +149,6 @@ def fetch_yf_close(
         out.index = pd.to_datetime(out.index)
         return out.sort_index()
 
-    # Case 2: single ticker flat columns
     if "Close" in df.columns:
         t = tickers[0] if len(tickers) == 1 else "Close"
         out = pd.DataFrame({t: df["Close"]})
@@ -170,17 +159,11 @@ def fetch_yf_close(
 
 
 def resample_monthly_last(s: pd.Series) -> pd.Series:
-    if s.empty:
-        return s
-    return s.resample("M").last().dropna()
+    return s.resample("ME").last().dropna() if not s.empty else s
 
 
 def yoy_change(s: pd.Series) -> pd.Series:
     return s.pct_change(12) * 100.0
-
-
-def mom_change(s: pd.Series) -> pd.Series:
-    return s.pct_change(1) * 100.0
 
 
 def safe_last(s: pd.Series) -> float:
@@ -200,13 +183,6 @@ def pct_from_n_days(s: pd.Series, n: int) -> float:
     return (s.iloc[-1] / s.iloc[-1 - n] - 1.0) * 100.0
 
 
-def pct_from_n_periods(s: pd.Series, n: int) -> float:
-    s = s.dropna()
-    if len(s) <= n:
-        return np.nan
-    return (s.iloc[-1] / s.iloc[-1 - n] - 1.0) * 100.0
-
-
 def rolling_max_drawdown(prices: pd.Series) -> float:
     p = prices.dropna()
     if p.empty:
@@ -220,45 +196,38 @@ def compute_dma(prices: pd.Series, window: int) -> pd.Series:
     return prices.rolling(window).mean()
 
 
-def higher_low_signal(prices: pd.Series, lookback: int = 120) -> bool:
+def higher_low_signal(prices: pd.Series, lookback: int = 120) -> int:
     p = prices.dropna()
     if len(p) < lookback:
-        return False
+        return 0
     recent = p.iloc[-lookback:]
     half = lookback // 2
     low1 = recent.iloc[:half].min()
     low2 = recent.iloc[half:].min()
-    return low2 > low1
+    ratio = low2 / low1 if low1 != 0 else 1.0
+
+    if ratio > 1.03:
+        return 2      # strong
+    elif ratio > 1.00:
+        return 1      # neutral/weak positive
+    return 0
 
 
-def slope_positive(s: pd.Series, window: int = 20) -> bool:
+def slope_value(s: pd.Series, window: int = 20) -> float:
     x = s.dropna()
     if len(x) < window:
-        return False
+        return np.nan
     y = x.iloc[-window:].values
     coeff = np.polyfit(np.arange(len(y)), y, 1)[0]
-    return coeff > 0
-
-
-def slope_negative(s: pd.Series, window: int = 20) -> bool:
-    x = s.dropna()
-    if len(x) < window:
-        return False
-    y = x.iloc[-window:].values
-    coeff = np.polyfit(np.arange(len(y)), y, 1)[0]
-    return coeff < 0
+    return float(coeff)
 
 
 def fmt_num(x: float, nd: int = 2) -> str:
-    if pd.isna(x):
-        return "N/A"
-    return f"{x:,.{nd}f}"
+    return "N/A" if pd.isna(x) else f"{x:,.{nd}f}"
 
 
 def fmt_pct(x: float, nd: int = 2) -> str:
-    if pd.isna(x):
-        return "N/A"
-    return f"{x:,.{nd}f}%"
+    return "N/A" if pd.isna(x) else f"{x:,.{nd}f}%"
 
 
 def make_line_chart(
@@ -274,14 +243,7 @@ def make_line_chart(
 
     fig = go.Figure()
     for c in plot_df.columns:
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df.index,
-                y=plot_df[c],
-                mode="lines",
-                name=c,
-            )
-        )
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df[c], mode="lines", name=c))
 
     fig.update_layout(
         title=title,
@@ -295,13 +257,13 @@ def make_line_chart(
     return fig
 
 
-def make_bar_score_chart(scores: Dict[str, int], title: str) -> go.Figure:
+def make_bar_score_chart(scores: Dict[str, float], title: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=list(scores.keys()),
             y=list(scores.values()),
-            text=list(scores.values()),
+            text=[f"{v:.1f}" for v in scores.values()],
             textposition="outside",
         )
     )
@@ -310,17 +272,17 @@ def make_bar_score_chart(scores: Dict[str, int], title: str) -> go.Figure:
         height=380,
         margin=dict(l=20, r=20, t=60, b=20),
         yaxis_title="Score",
+        yaxis=dict(range=[0, 1.1]),
     )
     return fig
 
 
-@dataclass
-class SignalResult:
-    label: str
-    value: str
-    status: str
-    score: int
-    comment: str
+def score_to_status(score: float) -> str:
+    if score >= 1.0:
+        return "positive"
+    if score >= 0.5:
+        return "neutral"
+    return "negative"
 
 
 def status_emoji(status: str) -> str:
@@ -332,6 +294,23 @@ def status_emoji(status: str) -> str:
     if status == "negative":
         return "🔴"
     return "⚪"
+
+
+@dataclass
+class SignalResult:
+    label: str
+    value: str
+    status: str
+    score: float
+    comment: str
+
+
+def slice_lookback(df_or_s: pd.DataFrame | pd.Series, label: str):
+    if label == "max":
+        return df_or_s
+    years = int(label.replace("y", ""))
+    cutoff = pd.Timestamp.today() - relativedelta(years=years)
+    return df_or_s[df_or_s.index >= cutoff]
 
 
 # -----------------------------
@@ -359,11 +338,12 @@ with st.sidebar:
     oil_proxy = st.selectbox("Oil proxy", ["WTI", "Brent"], index=0)
     bond_proxy = st.selectbox("Bond proxy", ["TLT", "IEF"], index=0)
 
+    show_debug = st.checkbox("Show debug info", value=True)
+
     st.markdown("---")
-    st.caption("Tip: set FRED_API_KEY in environment variables or Streamlit secrets.")
+    st.caption("Set FRED_API_KEY in environment variables or Streamlit secrets.")
 
 fred_api_key = get_fred_api_key()
-
 if not fred_api_key:
     st.error("FRED_API_KEY not found. Please set it in environment variables or .streamlit/secrets.toml")
     st.stop()
@@ -382,17 +362,13 @@ with st.spinner("Loading FRED data..."):
             fred_data[name] = pd.Series(dtype=float)
             st.warning(f"Failed to load FRED series {name} ({sid}): {e}")
 
-yf_names = list(YF_TICKERS.keys())
-yf_symbols = list(YF_TICKERS.values())
-
 with st.spinner("Loading Yahoo Finance data..."):
     try:
-        yf_close = fetch_yf_close(yf_symbols, period="15y", interval="1d")
+        yf_close = fetch_yf_close(list(YF_TICKERS.values()), period="15y", interval="1d")
     except Exception as e:
         st.error(f"Failed to load Yahoo Finance data: {e}")
         st.stop()
 
-# Rename Yahoo columns from symbol to friendly names
 rename_map = {v: k for k, v in YF_TICKERS.items()}
 yf_close = yf_close.rename(columns=rename_map)
 
@@ -403,7 +379,6 @@ if yf_close.empty:
 # -----------------------------
 # Derived series
 # -----------------------------
-# FRED monthly transforms
 cpi = resample_monthly_last(fred_data["CPI"])
 core_cpi = resample_monthly_last(fred_data["Core CPI"])
 unrate = resample_monthly_last(fred_data["Unemployment Rate"])
@@ -421,9 +396,8 @@ indpro_yoy = yoy_change(indpro)
 m2_yoy = yoy_change(m2)
 
 yc_10y_2y = (y10 - y2).dropna()
-yc_10y_3m = (y10.resample("M").last() - y3m.resample("M").last()).dropna()
+yc_10y_3m = (y10.resample("ME").last() - y3m.resample("ME").last()).dropna()
 
-# Price series
 spy = yf_close["SPY"].dropna() if "SPY" in yf_close.columns else pd.Series(dtype=float)
 qqq = yf_close["QQQ"].dropna() if "QQQ" in yf_close.columns else pd.Series(dtype=float)
 iwm = yf_close["IWM"].dropna() if "IWM" in yf_close.columns else pd.Series(dtype=float)
@@ -441,142 +415,215 @@ oil_series = wti if oil_proxy == "WTI" else brent
 bond_series = tlt if bond_proxy == "TLT" else ief
 equity_series = qqq if target_equity == "QQQ" else spy
 
-# Moving averages
 equity_ma_fast = compute_dma(equity_series, price_ma_fast)
 equity_ma_slow = compute_dma(equity_series, price_ma_slow)
 
-spy_ma_fast = compute_dma(spy, price_ma_fast)
-spy_ma_slow = compute_dma(spy, price_ma_slow)
-qqq_ma_fast = compute_dma(qqq, price_ma_fast)
-qqq_ma_slow = compute_dma(qqq, price_ma_slow)
+# -----------------------------
+# Scoring helpers
+# -----------------------------
+def score_price_vs_ma(price_last: float, ma_last: float, neutral_band: float = 0.01) -> float:
+    if pd.isna(price_last) or pd.isna(ma_last) or ma_last == 0:
+        return 0.0
+    rel = price_last / ma_last - 1.0
+    if rel > neutral_band:
+        return 1.0
+    if rel >= -neutral_band:
+        return 0.5
+    return 0.0
+
+
+def score_slope(series: pd.Series, window: int = 20, flat_threshold_ratio: float = 0.0005) -> float:
+    s = series.dropna()
+    if len(s) < window:
+        return 0.0
+    slope = slope_value(s, window=window)
+    level = abs(s.iloc[-1])
+    if pd.isna(slope) or level == 0:
+        return 0.0
+    ratio = slope / level
+    if ratio > flat_threshold_ratio:
+        return 1.0
+    if ratio > -flat_threshold_ratio:
+        return 0.5
+    return 0.0
+
 
 # -----------------------------
-# Scores / Signals
+# Build signals
 # -----------------------------
 macro_signals: List[SignalResult] = []
 market_signals: List[SignalResult] = []
 
-# Macro 1: Oil pressure cooling?
-oil_3m = pct_from_n_days(oil_series, 63)
+# Macro 1: Oil pressure
+oil_len = len(oil_series.dropna())
 oil_1m = pct_from_n_days(oil_series, 21)
-if pd.notna(oil_1m) and pd.notna(oil_3m):
-    if oil_1m < 0 and oil_3m < 10:
-        macro_signals.append(SignalResult("Oil Pressure", fmt_pct(oil_1m), "positive", 1, "Oil pressure cooling"))
+oil_3m = pct_from_n_days(oil_series, 63)
+
+if oil_len < 70 or pd.isna(oil_1m) or pd.isna(oil_3m):
+    score = 0.5
+    comment = "Insufficient or unstable data; treated as neutral"
+    value = "N/A"
+else:
+    value = f"1M {fmt_pct(oil_1m)} / 3M {fmt_pct(oil_3m)}"
+    if oil_1m < -3 and oil_3m < 5:
+        score = 1.0
+        comment = "Oil pressure clearly cooling"
     elif oil_1m < oil_3m:
-        macro_signals.append(SignalResult("Oil Pressure", fmt_pct(oil_1m), "neutral", 0, "Oil still elevated but momentum cooling"))
+        score = 0.5
+        comment = "Oil still elevated but momentum cooling"
     else:
-        macro_signals.append(SignalResult("Oil Pressure", fmt_pct(oil_1m), "negative", 0, "Oil still pressuring inflation"))
-else:
-    macro_signals.append(SignalResult("Oil Pressure", "N/A", "neutral", 0, "Insufficient data"))
+        score = 0.0
+        comment = "Oil still pressuring inflation"
 
-# Macro 2: 10Y yield falling?
-y10_1m = pct_from_n_periods(y10, 21)
+macro_signals.append(SignalResult(
+    "Oil Pressure", value, score_to_status(score), score, comment
+))
+
+# Macro 2: 10Y trend
 y10_last = safe_last(y10)
-y10_prev_month_level = safe_prev(y10, 21)
-if pd.notna(y10_last) and pd.notna(y10_prev_month_level):
-    if y10_last < y10_prev_month_level:
-        macro_signals.append(SignalResult("10Y Yield Trend", f"{fmt_num(y10_last)}%", "positive", 1, "Discount rate easing"))
+y10_1m_ago = safe_prev(y10, 21)
+if pd.notna(y10_last) and pd.notna(y10_1m_ago):
+    delta = y10_last - y10_1m_ago
+    if delta < -0.15:
+        score = 1.0
+        comment = "Discount rate easing meaningfully"
+    elif delta <= 0.05:
+        score = 0.5
+        comment = "Rates stabilizing"
     else:
-        macro_signals.append(SignalResult("10Y Yield Trend", f"{fmt_num(y10_last)}%", "negative", 0, "Discount rate still elevated"))
+        score = 0.0
+        comment = "Discount rate still elevated"
 else:
-    macro_signals.append(SignalResult("10Y Yield Trend", "N/A", "neutral", 0, "Insufficient data"))
+    score = 0.5
+    comment = "Insufficient data"
 
-# Macro 3: Core CPI cooling?
+macro_signals.append(SignalResult(
+    "10Y Yield Trend", f"{fmt_num(y10_last)}%", score_to_status(score), score, comment
+))
+
+# Macro 3: Core CPI YoY
 core_last = safe_last(core_cpi_yoy)
 core_prev = safe_prev(core_cpi_yoy, 1)
 if pd.notna(core_last) and pd.notna(core_prev):
-    if core_last < core_prev:
-        macro_signals.append(SignalResult("Core CPI YoY", fmt_pct(core_last), "positive", 1, "Core inflation cooling"))
-    elif abs(core_last - core_prev) < 0.15:
-        macro_signals.append(SignalResult("Core CPI YoY", fmt_pct(core_last), "neutral", 0, "Core inflation sticky"))
+    diff = core_last - core_prev
+    if diff < -0.10:
+        score = 1.0
+        comment = "Core inflation cooling"
+    elif diff <= 0.10:
+        score = 0.5
+        comment = "Core inflation sticky but not worsening much"
     else:
-        macro_signals.append(SignalResult("Core CPI YoY", fmt_pct(core_last), "negative", 0, "Core inflation re-accelerating"))
+        score = 0.0
+        comment = "Core inflation re-accelerating"
 else:
-    macro_signals.append(SignalResult("Core CPI YoY", "N/A", "neutral", 0, "Insufficient data"))
+    score = 0.5
+    comment = "Insufficient data"
 
-# Macro 4: Unemployment not spiking too hard?
+macro_signals.append(SignalResult(
+    "Core CPI YoY", fmt_pct(core_last), score_to_status(score), score, comment
+))
+
+# Macro 4: Unemployment
 un_last = safe_last(unrate)
 un_3m_ago = safe_prev(unrate, 3)
 if pd.notna(un_last) and pd.notna(un_3m_ago):
     delta = un_last - un_3m_ago
-    if 0 <= delta <= 0.3:
-        macro_signals.append(SignalResult("Unemployment", fmt_num(un_last), "positive", 1, "Soft deterioration, not severe"))
-    elif delta < 0:
-        macro_signals.append(SignalResult("Unemployment", fmt_num(un_last), "neutral", 0, "Labor market still firm"))
+    if 0 <= delta <= 0.30:
+        score = 1.0
+        comment = "Soft deterioration, not severe"
+    elif -0.10 <= delta < 0:
+        score = 0.5
+        comment = "Labor market still firm"
     else:
-        macro_signals.append(SignalResult("Unemployment", fmt_num(un_last), "negative", 0, "Labor market weakening fast"))
+        score = 0.0
+        comment = "Labor market weakening fast"
 else:
-    macro_signals.append(SignalResult("Unemployment", "N/A", "neutral", 0, "Insufficient data"))
+    score = 0.5
+    comment = "Insufficient data"
 
-# Macro 5: Yield curve steepening?
+macro_signals.append(SignalResult(
+    "Unemployment", fmt_num(un_last), score_to_status(score), score, comment
+))
+
+# Macro 5: 10Y-2Y curve
 yc_last = safe_last(yc_10y_2y)
 yc_1m_ago = safe_prev(yc_10y_2y, 21)
 if pd.notna(yc_last) and pd.notna(yc_1m_ago):
-    if yc_last > yc_1m_ago:
-        macro_signals.append(SignalResult("10Y-2Y Curve", fmt_num(yc_last), "positive", 1, "Curve steepening"))
+    delta = yc_last - yc_1m_ago
+    if delta > 0.15:
+        score = 1.0
+        comment = "Curve steepening"
+    elif delta >= -0.05:
+        score = 0.5
+        comment = "No major deterioration"
     else:
-        macro_signals.append(SignalResult("10Y-2Y Curve", fmt_num(yc_last), "neutral", 0, "No meaningful steepening"))
+        score = 0.0
+        comment = "Curve not improving"
 else:
-    macro_signals.append(SignalResult("10Y-2Y Curve", "N/A", "neutral", 0, "Insufficient data"))
+    score = 0.5
+    comment = "Insufficient data"
 
-macro_score = sum(x.score for x in macro_signals)
+macro_signals.append(SignalResult(
+    "10Y-2Y Curve", fmt_num(yc_last), score_to_status(score), score, comment
+))
 
-# Market 1: Primary equity above fast MA
+# Market 1: equity > fast MA
 eq_last = safe_last(equity_series)
 eq_ma_fast_last = safe_last(equity_ma_fast)
-if pd.notna(eq_last) and pd.notna(eq_ma_fast_last):
-    if eq_last > eq_ma_fast_last:
-        market_signals.append(SignalResult(f"{target_equity} > {price_ma_fast}DMA", fmt_num(eq_last), "positive", 1, "Short-to-medium trend recovered"))
-    else:
-        market_signals.append(SignalResult(f"{target_equity} > {price_ma_fast}DMA", fmt_num(eq_last), "negative", 0, "Still below fast trend"))
-else:
-    market_signals.append(SignalResult(f"{target_equity} > {price_ma_fast}DMA", "N/A", "neutral", 0, "Insufficient data"))
+score = score_price_vs_ma(eq_last, eq_ma_fast_last, neutral_band=0.01)
+comment = "Above fast trend" if score == 1.0 else ("Near fast trend" if score == 0.5 else "Still below fast trend")
+market_signals.append(SignalResult(
+    f"{target_equity} > {price_ma_fast}DMA", fmt_num(eq_last), score_to_status(score), score, comment
+))
 
-# Market 2: Primary equity above slow MA
+# Market 2: equity > slow MA
 eq_ma_slow_last = safe_last(equity_ma_slow)
-if pd.notna(eq_last) and pd.notna(eq_ma_slow_last):
-    if eq_last > eq_ma_slow_last:
-        market_signals.append(SignalResult(f"{target_equity} > {price_ma_slow}DMA", fmt_num(eq_last), "positive", 1, "Long trend confirmed"))
-    else:
-        market_signals.append(SignalResult(f"{target_equity} > {price_ma_slow}DMA", fmt_num(eq_last), "negative", 0, "Long trend not confirmed"))
-else:
-    market_signals.append(SignalResult(f"{target_equity} > {price_ma_slow}DMA", "N/A", "neutral", 0, "Insufficient data"))
+score = score_price_vs_ma(eq_last, eq_ma_slow_last, neutral_band=0.02)
+comment = "Long trend confirmed" if score == 1.0 else ("Near long trend" if score == 0.5 else "Long trend not confirmed")
+market_signals.append(SignalResult(
+    f"{target_equity} > {price_ma_slow}DMA", fmt_num(eq_last), score_to_status(score), score, comment
+))
 
-# Market 3: Higher low structure
-if higher_low_signal(equity_series, lookback=120):
-    market_signals.append(SignalResult("Higher Low", "True", "positive", 1, "Base-building structure"))
-else:
-    market_signals.append(SignalResult("Higher Low", "False", "negative", 0, "No base structure yet"))
+# Market 3: Higher low
+hl = higher_low_signal(equity_series, lookback=120)
+score = 1.0 if hl == 2 else (0.5 if hl == 1 else 0.0)
+comment = "Base-building structure" if score == 1.0 else ("Weak higher-low attempt" if score == 0.5 else "No base structure yet")
+market_signals.append(SignalResult(
+    "Higher Low", "True" if hl > 0 else "False", score_to_status(score), score, comment
+))
 
-# Market 4: HYG improving?
-if slope_positive(hyg, window=20):
-    market_signals.append(SignalResult("HYG Trend", fmt_num(safe_last(hyg)), "positive", 1, "Credit market supportive"))
-else:
-    market_signals.append(SignalResult("HYG Trend", fmt_num(safe_last(hyg)), "negative", 0, "Credit market not supportive"))
+# Market 4: HYG
+score = score_slope(hyg, window=20, flat_threshold_ratio=0.0005)
+comment = "Credit market supportive" if score == 1.0 else ("Credit market stabilizing" if score == 0.5 else "Credit market not supportive")
+market_signals.append(SignalResult(
+    "HYG Trend", fmt_num(safe_last(hyg)), score_to_status(score), score, comment
+))
 
-# Market 5: Bond proxy improving?
-if slope_positive(bond_series, window=20):
-    market_signals.append(SignalResult(f"{bond_proxy} Trend", fmt_num(safe_last(bond_series)), "positive", 1, "Bond market aligns with easing"))
-else:
-    market_signals.append(SignalResult(f"{bond_proxy} Trend", fmt_num(safe_last(bond_series)), "negative", 0, "Bond market not confirming easing"))
+# Market 5: Bond proxy
+score = score_slope(bond_series, window=20, flat_threshold_ratio=0.0005)
+comment = "Bond market confirms easing" if score == 1.0 else ("Bond market stabilizing" if score == 0.5 else "Bond market not confirming easing")
+market_signals.append(SignalResult(
+    f"{bond_proxy} Trend", fmt_num(safe_last(bond_series)), score_to_status(score), score, comment
+))
 
+macro_score = sum(x.score for x in macro_signals)
 market_score = sum(x.score for x in market_signals)
 total_score = macro_score + market_score
 
 # -----------------------------
-# Regime / Entry mode
+# Regime
 # -----------------------------
-if total_score <= 3:
+if total_score <= 3.0:
     risk_environment = "Risk-Off"
     trend_status = "Downtrend / Fragile"
     entry_mode = "WAIT"
     entry_comment = "Macro and/or market confirmation is insufficient."
-elif 4 <= total_score <= 6:
+elif total_score <= 5.0:
     risk_environment = "Neutral"
     trend_status = "Base Building"
     entry_mode = "STARTER BUY"
     entry_comment = f"Consider initial allocation around {starter_allocation}%."
-elif 7 <= total_score <= 8:
+elif total_score <= 7.5:
     risk_environment = "Improving"
     trend_status = "Trend Confirmation"
     entry_mode = "ADD"
@@ -588,40 +635,30 @@ else:
     entry_comment = f"Trend and macro aligned. Full staged allocation possible: {starter_allocation + add_allocation + final_allocation}%."
 
 # -----------------------------
-# Lookback slicing
+# Header
 # -----------------------------
-def slice_lookback(df_or_s: pd.DataFrame | pd.Series, label: str):
-    if label == "max":
-        return df_or_s
-    years = int(label.replace("y", ""))
-    cutoff = pd.Timestamp.today() - relativedelta(years=years)
-    return df_or_s[df_or_s.index >= cutoff]
-
-# -----------------------------
-# Header metrics
-# -----------------------------
-m1, m2c, m3, m4, m5 = st.columns(5)
-m1.metric("Macro Score", f"{macro_score}/5")
-m2c.metric("Market Score", f"{market_score}/5")
-m3.metric("Total Score", f"{total_score}/10")
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Macro Score", f"{macro_score:.1f}/5")
+m2.metric("Market Score", f"{market_score:.1f}/5")
+m3.metric("Total Score", f"{total_score:.1f}/10")
 m4.metric("Risk Environment", risk_environment)
 m5.metric("Entry Mode", entry_mode)
-
 st.caption(entry_comment)
 
 # -----------------------------
 # Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Market Snapshot",
     "Macro Scorecard",
     "Signal Charts",
     "Trend Confirmation",
-    "Regime & Entry Plan"
+    "Regime & Entry Plan",
+    "Debug"
 ])
 
 # ============================================================
-# TAB 1: Market Snapshot
+# TAB 1
 # ============================================================
 with tab1:
     st.subheader("Market Snapshot")
@@ -678,16 +715,11 @@ with tab1:
         oil_proxy: slice_lookback(oil_series, lookback_label),
     }).dropna(how="all")
 
-    fig = make_line_chart(
-        chart_df,
-        title=f"Normalized Multi-Asset Snapshot ({lookback_label})",
-        ytitle="Indexed to 100",
-        normalize=True
-    )
+    fig = make_line_chart(chart_df, f"Normalized Multi-Asset Snapshot ({lookback_label})", "Indexed to 100", normalize=True)
     st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
-# TAB 2: Macro Scorecard
+# TAB 2
 # ============================================================
 with tab2:
     st.subheader("Macro Scorecard")
@@ -709,17 +741,22 @@ with tab2:
     } for s in market_signals])
 
     c1, c2 = st.columns(2)
+
     with c1:
         st.markdown("#### Macro Signals")
         st.dataframe(macro_table, use_container_width=True, hide_index=True)
-        macro_bar = make_bar_score_chart({s.label: s.score for s in macro_signals}, "Macro Signal Scores")
-        st.plotly_chart(macro_bar, use_container_width=True)
+        st.plotly_chart(
+            make_bar_score_chart({s.label: s.score for s in macro_signals}, "Macro Signal Scores"),
+            use_container_width=True
+        )
 
     with c2:
         st.markdown("#### Market Signals")
         st.dataframe(market_table, use_container_width=True, hide_index=True)
-        market_bar = make_bar_score_chart({s.label: s.score for s in market_signals}, "Market Signal Scores")
-        st.plotly_chart(market_bar, use_container_width=True)
+        st.plotly_chart(
+            make_bar_score_chart({s.label: s.score for s in market_signals}, "Market Signal Scores"),
+            use_container_width=True
+        )
 
     st.markdown("#### Macro Data Snapshot")
     macro_snapshot = pd.DataFrame([
@@ -740,7 +777,7 @@ with tab2:
     )
 
 # ============================================================
-# TAB 3: Signal Charts
+# TAB 3
 # ============================================================
 with tab3:
     st.subheader("Signal Charts")
@@ -752,15 +789,13 @@ with tab3:
             slice_lookback(cpi_yoy.rename("CPI YoY"), lookback_label),
             slice_lookback(core_cpi_yoy.rename("Core CPI YoY"), lookback_label),
         ], axis=1).dropna(how="all")
-        fig = make_line_chart(infl_df, f"Inflation Trend ({lookback_label})", ytitle="%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(make_line_chart(infl_df, f"Inflation Trend ({lookback_label})", "%"), use_container_width=True)
 
         yc_df = pd.concat([
             slice_lookback(yc_10y_2y.rename("10Y-2Y"), lookback_label),
             slice_lookback(yc_10y_3m.rename("10Y-3M"), lookback_label),
         ], axis=1).dropna(how="all")
-        fig = make_line_chart(yc_df, f"Yield Curve ({lookback_label})", ytitle="%p")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(make_line_chart(yc_df, f"Yield Curve ({lookback_label})", "%p"), use_container_width=True)
 
     with c2:
         rates_df = pd.concat([
@@ -768,19 +803,17 @@ with tab3:
             slice_lookback(y2.rename("2Y"), lookback_label),
             slice_lookback(fedfunds.rename("Fed Funds"), lookback_label),
         ], axis=1).dropna(how="all")
-        fig = make_line_chart(rates_df, f"Rates ({lookback_label})", ytitle="%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(make_line_chart(rates_df, f"Rates ({lookback_label})", "%"), use_container_width=True)
 
         growth_df = pd.concat([
             slice_lookback(unrate.rename("Unemployment"), lookback_label),
             slice_lookback(indpro_yoy.rename("Industrial Production YoY"), lookback_label),
             slice_lookback(m2_yoy.rename("M2 YoY"), lookback_label),
         ], axis=1).dropna(how="all")
-        fig = make_line_chart(growth_df, f"Growth / Liquidity ({lookback_label})", ytitle="%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(make_line_chart(growth_df, f"Growth / Liquidity ({lookback_label})", "%"), use_container_width=True)
 
 # ============================================================
-# TAB 4: Trend Confirmation
+# TAB 4
 # ============================================================
 with tab4:
     st.subheader("Trend Confirmation")
@@ -807,7 +840,8 @@ with tab4:
     c1.metric(f"{target_equity} Last", fmt_num(safe_last(equity_series)))
     c2.metric(f"{price_ma_fast}DMA", fmt_num(safe_last(equity_ma_fast)))
     c3.metric(f"{price_ma_slow}DMA", fmt_num(safe_last(equity_ma_slow)))
-    c4.metric("Higher Low", "Yes" if higher_low_signal(equity_series) else "No")
+    hl = higher_low_signal(equity_series)
+    c4.metric("Higher Low", "Strong" if hl == 2 else ("Weak" if hl == 1 else "No"))
 
     st.markdown("#### Risk-On Confirmation Basket")
     basket = pd.concat([
@@ -819,16 +853,10 @@ with tab4:
         slice_lookback(soxx.rename("SOXX"), lookback_label),
     ], axis=1).dropna(how="all")
 
-    fig = make_line_chart(
-        basket,
-        title=f"Risk-On Basket ({lookback_label})",
-        ytitle="Indexed to 100",
-        normalize=True
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(make_line_chart(basket, f"Risk-On Basket ({lookback_label})", "Indexed to 100", normalize=True), use_container_width=True)
 
 # ============================================================
-# TAB 5: Regime & Entry Plan
+# TAB 5
 # ============================================================
 with tab5:
     st.subheader("Regime & Entry Plan")
@@ -836,46 +864,37 @@ with tab5:
     c1, c2 = st.columns([1, 1])
 
     with c1:
-        st.markdown("#### Current Regime")
         regime_df = pd.DataFrame([
             {"Item": "Risk Environment", "Value": risk_environment},
             {"Item": "Trend Status", "Value": trend_status},
             {"Item": "Entry Mode", "Value": entry_mode},
-            {"Item": "Macro Score", "Value": f"{macro_score}/5"},
-            {"Item": "Market Score", "Value": f"{market_score}/5"},
-            {"Item": "Total Score", "Value": f"{total_score}/10"},
+            {"Item": "Macro Score", "Value": f"{macro_score:.1f}/5"},
+            {"Item": "Market Score", "Value": f"{market_score:.1f}/5"},
+            {"Item": "Total Score", "Value": f"{total_score:.1f}/10"},
         ])
+        st.markdown("#### Current Regime")
         st.dataframe(regime_df, use_container_width=True, hide_index=True)
 
-        st.markdown("#### Suggested Allocation Plan")
         alloc_df = pd.DataFrame([
             {"Step": "Starter Buy", "Allocation %": starter_allocation, "Condition": "Macro stabilizing, early confirmation"},
-            {"Step": "Add", "Allocation %": add_allocation, "Condition": "Trend confirmed, price > fast MA, supportive credit/bonds"},
-            {"Step": "Final Add", "Allocation %": final_allocation, "Condition": "Price > slow MA, pullback holds, regime improving"},
+            {"Step": "Add", "Allocation %": add_allocation, "Condition": "Trend confirmed, price near/above MA, supportive credit/bonds"},
+            {"Step": "Final Add", "Allocation %": final_allocation, "Condition": "Price above slow MA, pullback holds, regime improving"},
         ])
+        st.markdown("#### Suggested Allocation Plan")
         st.dataframe(alloc_df, use_container_width=True, hide_index=True)
 
     with c2:
-        st.markdown("#### Decision Rules")
         rules = pd.DataFrame([
-            {"Score Range": "0-3", "Mode": "WAIT", "Interpretation": "Risk-off. Preserve cash and observe."},
-            {"Score Range": "4-6", "Mode": "STARTER BUY", "Interpretation": "Base building. Small initial entry only."},
-            {"Score Range": "7-8", "Mode": "ADD", "Interpretation": "Trend confirmation improving. Add in stages."},
-            {"Score Range": "9-10", "Mode": "AGGRESSIVE BUY", "Interpretation": "Macro + market aligned. Full staged plan allowed."},
+            {"Score Range": "0.0-3.0", "Mode": "WAIT", "Interpretation": "Risk-off. Preserve cash and observe."},
+            {"Score Range": "3.5-5.0", "Mode": "STARTER BUY", "Interpretation": "Base building. Small initial entry only."},
+            {"Score Range": "5.5-7.5", "Mode": "ADD", "Interpretation": "Trend confirmation improving. Add in stages."},
+            {"Score Range": "8.0-10.0", "Mode": "AGGRESSIVE BUY", "Interpretation": "Macro + market aligned. Full staged plan allowed."},
         ])
+        st.markdown("#### Decision Rules")
         st.dataframe(rules, use_container_width=True, hide_index=True)
 
         st.markdown("#### Live Interpretation")
         st.info(entry_comment)
-
-    st.markdown("#### What this dashboard is checking")
-    st.write(
-        """
-        1. **Macro filter:** Is inflation pressure cooling and are rates becoming less restrictive?  
-        2. **Stress check:** Is the market stopping its deterioration?  
-        3. **Trend confirmation:** Has price actually recovered enough to justify staged buying?
-        """
-    )
 
     st.markdown("#### Raw Signal Summary")
     raw_all = pd.DataFrame([{
@@ -896,11 +915,66 @@ with tab5:
 
     st.dataframe(raw_all, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# Footer
-# -----------------------------
+# ============================================================
+# TAB 6
+# ============================================================
+with tab6:
+    st.subheader("Debug")
+
+    if show_debug:
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.markdown("#### Oil Debug")
+            oil_debug_df = pd.DataFrame({
+                "Metric": [
+                    "Selected Oil Proxy",
+                    "Series Length",
+                    "Last Price",
+                    "1M Return %",
+                    "3M Return %",
+                    "Last Date",
+                ],
+                "Value": [
+                    oil_proxy,
+                    oil_len,
+                    fmt_num(safe_last(oil_series)),
+                    fmt_pct(oil_1m),
+                    fmt_pct(oil_3m),
+                    str(oil_series.dropna().index[-1].date()) if oil_len > 0 else "N/A",
+                ]
+            })
+            st.dataframe(oil_debug_df, use_container_width=True, hide_index=True)
+            st.write("Oil last 10 rows")
+            st.dataframe(oil_series.tail(10).to_frame(name=oil_proxy), use_container_width=True)
+
+        with c2:
+            st.markdown("#### Trend Debug")
+            trend_debug_df = pd.DataFrame({
+                "Metric": [
+                    f"{target_equity} Last",
+                    f"{target_equity} {price_ma_fast}DMA",
+                    f"{target_equity} {price_ma_slow}DMA",
+                    "HYG Slope(20d)",
+                    f"{bond_proxy} Slope(20d)",
+                    "Higher Low Signal",
+                ],
+                "Value": [
+                    fmt_num(eq_last),
+                    fmt_num(eq_ma_fast_last),
+                    fmt_num(eq_ma_slow_last),
+                    fmt_num(slope_value(hyg, 20), 6),
+                    fmt_num(slope_value(bond_series, 20), 6),
+                    "Strong" if hl == 2 else ("Weak" if hl == 1 else "No"),
+                ]
+            })
+            st.dataframe(trend_debug_df, use_container_width=True, hide_index=True)
+            st.write("Recent HYG")
+            st.dataframe(hyg.tail(10).to_frame(name="HYG"), use_container_width=True)
+            st.write(f"Recent {bond_proxy}")
+            st.dataframe(bond_series.tail(10).to_frame(name=bond_proxy), use_container_width=True)
+    else:
+        st.info("Enable 'Show debug info' in the sidebar.")
+
 st.markdown("---")
-st.caption(
-    "Framework: FRED for macro regime filtering + yfinance for execution timing. "
-    "Use as a decision-support tool, not as financial advice."
-)
+st.caption("Framework: FRED for macro regime filtering + yfinance for execution timing.")
