@@ -1,13 +1,11 @@
 # streamlit_app.py
 # ============================================================
-# QQQ / SPY Phase-Based Buying Strategy Dashboard
+# QQQ / SPY Phase Buying Strategy Dashboard
 # ------------------------------------------------------------
-# Features:
-#   - FRED + yfinance macro/market regime classification
-#   - Option-based strategy profile
-#   - Conservative / Balanced / Aggressive selection
-#   - Phase allocation mode: Default / Custom
-#   - Auto QQQ/SPY buy plan by market phase
+# Fixes:
+#   - Removed risky style.format() usage on mixed-type columns
+#   - Added safe display formatting helpers
+#   - Keeps phase-based QQQ / SPY option strategy
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -25,7 +23,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 import numpy as np
 import pandas as pd
@@ -166,10 +164,6 @@ st.markdown("""
     padding: 14px;
     background: rgba(255,255,255,0.02);
     min-height: 260px;
-}
-
-.phase-active {
-    font-weight: 800;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -503,15 +497,15 @@ def build_phase_plan(
     return pd.DataFrame(rows)
 
 
-def build_action_items(signals: List[SignalResult], target_equity: str, fast_ma: int, slow_ma: int, bond_proxy: str) -> List[str]:
+def build_action_items(signals: List[SignalResult], fast_ma: int, slow_ma: int, bond_proxy: str) -> List[str]:
     mapping = {
         "Oil Pressure": "Oil momentum cooling further",
         "10Y Yield": "10Y yield trending lower",
         "Core CPI YoY": "Core CPI continuing to cool",
         "Unemployment": "Labor softening without sharp spike",
         "10Y-2Y Curve": "Yield curve steepening meaningfully",
-        f"{target_equity} > {fast_ma}DMA": f"{target_equity} reclaiming {fast_ma}DMA",
-        f"{target_equity} > {slow_ma}DMA": f"{target_equity} reclaiming {slow_ma}DMA",
+        f"QQQ > {fast_ma}DMA": f"QQQ reclaiming {fast_ma}DMA",
+        f"QQQ > {slow_ma}DMA": f"QQQ reclaiming {slow_ma}DMA",
         "Higher Low": "Higher low structure forming",
         "HYG Trend": "Credit market stabilizing",
         f"{bond_proxy} Trend": f"{bond_proxy} confirming easing",
@@ -522,6 +516,23 @@ def build_action_items(signals: List[SignalResult], target_equity: str, fast_ma:
             out.append(f"**{s.label}** — {mapping.get(s.label, 'Needs improvement')}")
     return out[:6]
 
+
+def format_mixed_value(x: Any) -> str:
+    if isinstance(x, (int, float, np.integer, np.floating)) and not pd.isna(x):
+        return f"{x:,.2f}"
+    return str(x)
+
+
+def display_dataframe(df: pd.DataFrame, numeric_decimals: int = 2) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = out[col].apply(
+                lambda x: f"{x:,.{numeric_decimals}f}" if pd.notna(x) else "N/A"
+            )
+        else:
+            out[col] = out[col].astype(str)
+    return out
 
 # ------------------------------------------------------------
 # Sidebar
@@ -657,8 +668,6 @@ bond_series = tlt if bond_proxy == "TLT" else ief
 
 qqq_ma_fast = compute_dma(qqq, price_ma_fast)
 qqq_ma_slow = compute_dma(qqq, price_ma_slow)
-spy_ma_fast = compute_dma(spy, price_ma_fast)
-spy_ma_slow = compute_dma(spy, price_ma_slow)
 
 # ------------------------------------------------------------
 # Signals
@@ -666,7 +675,6 @@ spy_ma_slow = compute_dma(spy, price_ma_slow)
 macro_signals: List[SignalResult] = []
 market_signals: List[SignalResult] = []
 
-# Macro 1: Oil pressure
 oil_len = len(oil_series.dropna())
 oil_last = safe_last(oil_series)
 oil_1m = pct_from_n_days(oil_series, 21)
@@ -692,7 +700,6 @@ else:
 
 macro_signals.append(SignalResult("Oil Pressure", value, score_to_status(score), score, comment, detail, "High"))
 
-# Macro 2: 10Y Yield
 y10_last = safe_last(y10)
 y10_1m_ago = safe_prev(y10, 21)
 if pd.notna(y10_last) and pd.notna(y10_1m_ago):
@@ -713,7 +720,6 @@ else:
     detail = "No stable comparison"
 macro_signals.append(SignalResult("10Y Yield", f"{fmt_num(y10_last)}%", score_to_status(score), score, comment, detail, "High"))
 
-# Macro 3: Core CPI
 core_last = safe_last(core_cpi_yoy)
 core_prev = safe_prev(core_cpi_yoy, 1)
 if pd.notna(core_last) and pd.notna(core_prev):
@@ -734,7 +740,6 @@ else:
     detail = "No stable comparison"
 macro_signals.append(SignalResult("Core CPI YoY", fmt_pct(core_last), score_to_status(score), score, comment, detail, "Medium"))
 
-# Macro 4: Unemployment
 un_last = safe_last(unrate)
 un_3m_ago = safe_prev(unrate, 3)
 if pd.notna(un_last) and pd.notna(un_3m_ago):
@@ -755,7 +760,6 @@ else:
     detail = "No stable comparison"
 macro_signals.append(SignalResult("Unemployment", fmt_num(un_last), score_to_status(score), score, comment, detail, "Medium"))
 
-# Macro 5: Curve
 yc_last = safe_last(yc_10y_2y)
 yc_1m_ago = safe_prev(yc_10y_2y, 21)
 if pd.notna(yc_last) and pd.notna(yc_1m_ago):
@@ -776,7 +780,6 @@ else:
     detail = "No stable comparison"
 macro_signals.append(SignalResult("10Y-2Y Curve", fmt_num(yc_last), score_to_status(score), score, comment, detail, "Medium"))
 
-# Market 1: QQQ vs 50DMA
 qqq_last = safe_last(qqq)
 qqq_fast_last = safe_last(qqq_ma_fast)
 qqq_gap_fast = (qqq_last / qqq_fast_last - 1.0) * 100.0 if pd.notna(qqq_last) and pd.notna(qqq_fast_last) and qqq_fast_last != 0 else np.nan
@@ -785,7 +788,6 @@ comment = "Above fast trend" if score == 1.0 else ("Near fast trend" if score ==
 detail = f"Current {fmt_num(qqq_last)} vs {price_ma_fast}DMA {fmt_num(qqq_fast_last)} | Gap {fmt_pct(qqq_gap_fast)}"
 market_signals.append(SignalResult(f"QQQ > {price_ma_fast}DMA", fmt_num(qqq_last), score_to_status(score), score, comment, detail, "High"))
 
-# Market 2: QQQ vs 200DMA
 qqq_slow_last = safe_last(qqq_ma_slow)
 qqq_gap_slow = (qqq_last / qqq_slow_last - 1.0) * 100.0 if pd.notna(qqq_last) and pd.notna(qqq_slow_last) and qqq_slow_last != 0 else np.nan
 score = score_price_vs_ma(qqq_last, qqq_slow_last, neutral_band=0.02)
@@ -793,20 +795,17 @@ comment = "Long trend confirmed" if score == 1.0 else ("Near long trend" if scor
 detail = f"Current {fmt_num(qqq_last)} vs {price_ma_slow}DMA {fmt_num(qqq_slow_last)} | Gap {fmt_pct(qqq_gap_slow)}"
 market_signals.append(SignalResult(f"QQQ > {price_ma_slow}DMA", fmt_num(qqq_last), score_to_status(score), score, comment, detail, "High"))
 
-# Market 3: Higher Low
 hl = higher_low_signal(qqq, 120)
 score = 1.0 if hl == 2 else (0.5 if hl == 1 else 0.0)
 comment = "Base-building structure" if score == 1.0 else ("Weak higher-low attempt" if score == 0.5 else "No base structure yet")
 market_signals.append(SignalResult("Higher Low", "True" if hl > 0 else "False", score_to_status(score), score, comment, "Structure over 120 trading days", "High"))
 
-# Market 4: HYG
 hyg_last = safe_last(hyg)
 hyg_slope = slope_value(hyg, 20)
 score = score_slope(hyg, 20, 0.0005)
 comment = "Credit market supportive" if score == 1.0 else ("Credit market stabilizing" if score == 0.5 else "Credit market not supportive")
 market_signals.append(SignalResult("HYG Trend", fmt_num(hyg_last), score_to_status(score), score, comment, f"Last {fmt_num(hyg_last)} | 20d slope {fmt_num(hyg_slope, 6)}", "Medium"))
 
-# Market 5: Bond
 bond_last = safe_last(bond_series)
 bond_slope = slope_value(bond_series, 20)
 score = score_slope(bond_series, 20, 0.0005)
@@ -857,7 +856,7 @@ current_spy_amount = float(current_phase_row["SPY Buy Amount"])
 current_qqq_weight = int(current_phase_row["QQQ Weight %"])
 current_spy_weight = int(current_phase_row["SPY Weight %"])
 
-watch_items = build_action_items(macro_signals + market_signals, "QQQ", price_ma_fast, price_ma_slow, bond_proxy)
+watch_items = build_action_items(macro_signals + market_signals, price_ma_fast, price_ma_slow, bond_proxy)
 
 # ------------------------------------------------------------
 # Top summary
@@ -944,18 +943,7 @@ with tab2:
         "QQQ Weight %", "SPY Weight %", "QQQ Buy Amount", "SPY Buy Amount"
     ]]
 
-    st.dataframe(
-        display_df.style.format({
-            "Phase Allocation %": "{:,.0f}",
-            "Phase Amount": "{:,.0f}",
-            "QQQ Weight %": "{:,.0f}",
-            "SPY Weight %": "{:,.0f}",
-            "QQQ Buy Amount": "{:,.0f}",
-            "SPY Buy Amount": "{:,.0f}",
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(display_dataframe(display_df), use_container_width=True, hide_index=True)
 
     chart_df = phase_plan_df.set_index("Phase")[["QQQ Buy Amount", "SPY Buy Amount"]]
     fig = go.Figure()
@@ -977,7 +965,7 @@ with tab2:
         {"Phase": "Trend Confirmation", "Meaning": "Trend recovery appears", "Action": "Balanced or QQQ-leaning add"},
         {"Phase": "Risk-On", "Meaning": "Trend and macro aligned", "Action": "More aggressive QQQ allocation"},
     ])
-    st.dataframe(logic_df, use_container_width=True, hide_index=True)
+    st.dataframe(logic_df.astype(str), use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------
 # Tab 3: Market Dashboard
@@ -1011,18 +999,7 @@ with tab3:
             "Drawdown %": rolling_max_drawdown(s),
         })
     snapshot_df = pd.DataFrame(rows)
-    st.dataframe(
-        snapshot_df.style.format({
-            "Last": "{:,.2f}",
-            "1W %": "{:,.2f}",
-            "1M %": "{:,.2f}",
-            "3M %": "{:,.2f}",
-            "6M %": "{:,.2f}",
-            "1Y %": "{:,.2f}",
-            "Drawdown %": "{:,.2f}",
-        }),
-        use_container_width=True
-    )
+    st.dataframe(display_dataframe(snapshot_df), use_container_width=True, hide_index=True)
 
     multi_asset_df = pd.DataFrame({
         "SPY": slice_lookback(spy, lookback_label),
@@ -1105,7 +1082,7 @@ with tab4:
         "Comment": s.comment,
     } for s in market_signals])
 
-    st.dataframe(raw_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_dataframe(raw_df), use_container_width=True, hide_index=True)
 
     with st.expander("Macro snapshot", expanded=False):
         macro_snapshot = pd.DataFrame([
@@ -1119,11 +1096,7 @@ with tab4:
             {"Series": "2Y Yield", "Last": safe_last(y2), "Prev": safe_prev(y2, 21)},
             {"Series": "10Y-2Y", "Last": safe_last(yc_10y_2y), "Prev": safe_prev(yc_10y_2y, 21)},
         ])
-        st.dataframe(
-            macro_snapshot.style.format({"Last": "{:,.2f}", "Prev": "{:,.2f}"}),
-            use_container_width=True,
-            hide_index=True
-        )
+        st.dataframe(display_dataframe(macro_snapshot), use_container_width=True, hide_index=True)
 
     with st.expander("Current phase execution summary", expanded=False):
         current_exec_df = pd.DataFrame([
@@ -1136,11 +1109,8 @@ with tab4:
             {"Item": "QQQ Buy Amount", "Value": current_qqq_amount},
             {"Item": "SPY Buy Amount", "Value": current_spy_amount},
         ])
-        st.dataframe(
-            current_exec_df.style.format({"Value": "{:,.2f}"}),
-            use_container_width=True,
-            hide_index=True
-        )
+        current_exec_df["Value"] = current_exec_df["Value"].apply(format_mixed_value)
+        st.dataframe(current_exec_df.astype(str), use_container_width=True, hide_index=True)
 
     if show_debug:
         with st.expander("Debug", expanded=False):
@@ -1156,11 +1126,7 @@ with tab4:
                 {"Metric": "Total Score", "Value": total_score},
                 {"Metric": "Entry Readiness %", "Value": entry_readiness},
             ])
-            st.dataframe(
-                debug_df.style.format({"Value": "{:,.6f}"}),
-                use_container_width=True,
-                hide_index=True
-            )
+            st.dataframe(display_dataframe(debug_df, numeric_decimals=6), use_container_width=True, hide_index=True)
 
 st.markdown("---")
 st.caption("This dashboard combines market regime detection with phase-based QQQ/SPY staged buying execution.")
