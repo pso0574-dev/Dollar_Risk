@@ -1,12 +1,14 @@
 # streamlit_app.py
 # ============================================================
-# FRED + yfinance Entry Timing Dashboard (Improved Scoring)
+# FRED + yfinance Entry Timing Dashboard
+# UI Updated Version
 # ------------------------------------------------------------
-# Improvements:
-#   - 3-level scoring: 0 / 0.5 / 1
-#   - Neutral is no longer collapsed to 0
-#   - Oil debug section added
-#   - More realistic trend thresholds
+# Main UI changes:
+#   1) Top summary boxes
+#   2) Macro / Market card layout
+#   3) Why current score is low
+#   4) What to watch next
+#   5) Detailed tables/debug moved into expanders
 #
 # Run:
 #   streamlit run streamlit_app.py
@@ -16,7 +18,7 @@
 #
 # Environment:
 #   Set FRED_API_KEY in environment variables
-#   or create .streamlit/secrets.toml with:
+#   or .streamlit/secrets.toml
 #       FRED_API_KEY="YOUR_KEY"
 # ============================================================
 
@@ -24,7 +26,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,18 +36,18 @@ import streamlit as st
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
-# -----------------------------
+# ------------------------------------------------------------
 # Page config
-# -----------------------------
+# ------------------------------------------------------------
 st.set_page_config(
     page_title="Macro Entry Timing Dashboard",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# -----------------------------
+# ------------------------------------------------------------
 # Constants
-# -----------------------------
+# ------------------------------------------------------------
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 FRED_SERIES = {
@@ -79,9 +81,104 @@ YF_TICKERS = {
 
 DEFAULT_LOOKBACK_YEARS = 10
 
-# -----------------------------
-# Utilities
-# -----------------------------
+# ------------------------------------------------------------
+# Styling
+# ------------------------------------------------------------
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 1.2rem;
+    padding-bottom: 2rem;
+}
+
+.card-box {
+    border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 14px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    background: rgba(255,255,255,0.02);
+}
+
+.card-title {
+    font-size: 1.0rem;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+.card-status {
+    font-size: 0.95rem;
+    font-weight: 700;
+    margin-bottom: 6px;
+}
+
+.card-value {
+    font-size: 1.15rem;
+    font-weight: 700;
+    margin-bottom: 4px;
+}
+
+.card-sub {
+    font-size: 0.88rem;
+    opacity: 0.85;
+    margin-bottom: 4px;
+}
+
+.card-comment {
+    font-size: 0.88rem;
+    opacity: 0.92;
+}
+
+.section-title {
+    font-size: 1.2rem;
+    font-weight: 800;
+    margin-top: 0.4rem;
+    margin-bottom: 0.8rem;
+}
+
+.summary-box {
+    border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 16px;
+    padding: 16px 18px;
+    background: rgba(255,255,255,0.02);
+    min-height: 110px;
+}
+
+.summary-label {
+    font-size: 0.95rem;
+    opacity: 0.8;
+    margin-bottom: 8px;
+}
+
+.summary-value {
+    font-size: 1.45rem;
+    font-weight: 800;
+    line-height: 1.2;
+}
+
+.summary-sub {
+    font-size: 0.85rem;
+    opacity: 0.8;
+    margin-top: 8px;
+}
+
+.list-box {
+    border: 1px solid rgba(128,128,128,0.25);
+    border-radius: 14px;
+    padding: 14px 16px;
+    background: rgba(255,255,255,0.02);
+    min-height: 260px;
+}
+
+.small-note {
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 def get_fred_api_key() -> Optional[str]:
     key = None
     try:
@@ -104,7 +201,6 @@ def fetch_fred_series(series_id: str, api_key: str, start_date: str = "2000-01-0
     r = requests.get(FRED_BASE_URL, params=params, timeout=30)
     r.raise_for_status()
     data = r.json()
-
     obs = data.get("observations", [])
     if not obs:
         return pd.Series(dtype=float)
@@ -207,9 +303,9 @@ def higher_low_signal(prices: pd.Series, lookback: int = 120) -> int:
     ratio = low2 / low1 if low1 != 0 else 1.0
 
     if ratio > 1.03:
-        return 2      # strong
+        return 2
     elif ratio > 1.00:
-        return 1      # neutral/weak positive
+        return 1
     return 0
 
 
@@ -235,7 +331,7 @@ def make_line_chart(
     title: str,
     ytitle: str = "",
     normalize: bool = False,
-    height: int = 450,
+    height: int = 430,
 ) -> go.Figure:
     plot_df = df.copy()
     if normalize and not plot_df.empty:
@@ -243,7 +339,12 @@ def make_line_chart(
 
     fig = go.Figure()
     for c in plot_df.columns:
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df[c], mode="lines", name=c))
+        fig.add_trace(go.Scatter(
+            x=plot_df.index,
+            y=plot_df[c],
+            mode="lines",
+            name=c
+        ))
 
     fig.update_layout(
         title=title,
@@ -251,28 +352,8 @@ def make_line_chart(
         xaxis_title="Date",
         yaxis_title=ytitle,
         hovermode="x unified",
-        legend_title="Series",
         margin=dict(l=20, r=20, t=60, b=20),
-    )
-    return fig
-
-
-def make_bar_score_chart(scores: Dict[str, float], title: str) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Bar(
-            x=list(scores.keys()),
-            y=list(scores.values()),
-            text=[f"{v:.1f}" for v in scores.values()],
-            textposition="outside",
-        )
-    )
-    fig.update_layout(
-        title=title,
-        height=380,
-        margin=dict(l=20, r=20, t=60, b=20),
-        yaxis_title="Score",
-        yaxis=dict(range=[0, 1.1]),
+        legend_title="Series"
     )
     return fig
 
@@ -296,13 +377,31 @@ def status_emoji(status: str) -> str:
     return "⚪"
 
 
-@dataclass
-class SignalResult:
-    label: str
-    value: str
-    status: str
-    score: float
-    comment: str
+def score_price_vs_ma(price_last: float, ma_last: float, neutral_band: float = 0.01) -> float:
+    if pd.isna(price_last) or pd.isna(ma_last) or ma_last == 0:
+        return 0.0
+    rel = price_last / ma_last - 1.0
+    if rel > neutral_band:
+        return 1.0
+    if rel >= -neutral_band:
+        return 0.5
+    return 0.0
+
+
+def score_slope(series: pd.Series, window: int = 20, flat_threshold_ratio: float = 0.0005) -> float:
+    s = series.dropna()
+    if len(s) < window:
+        return 0.0
+    slope = slope_value(s, window=window)
+    level = abs(s.iloc[-1])
+    if pd.isna(slope) or level == 0:
+        return 0.0
+    ratio = slope / level
+    if ratio > flat_threshold_ratio:
+        return 1.0
+    if ratio > -flat_threshold_ratio:
+        return 0.5
+    return 0.0
 
 
 def slice_lookback(df_or_s: pd.DataFrame | pd.Series, label: str):
@@ -313,9 +412,63 @@ def slice_lookback(df_or_s: pd.DataFrame | pd.Series, label: str):
     return df_or_s[df_or_s.index >= cutoff]
 
 
-# -----------------------------
+def readiness_percent(total_score: float, max_score: float = 10.0) -> int:
+    if max_score <= 0:
+        return 0
+    pct = int(round((total_score / max_score) * 100))
+    return max(0, min(100, pct))
+
+
+def render_summary_box(label: str, value: str, sub: str = "") -> None:
+    st.markdown(
+        f"""
+        <div class="summary-box">
+            <div class="summary-label">{label}</div>
+            <div class="summary-value">{value}</div>
+            <div class="summary-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def render_signal_card(
+    title: str,
+    status: str,
+    value: str,
+    sub_value: str,
+    comment: str
+) -> None:
+    emoji = status_emoji(status)
+    status_text = status.capitalize()
+    st.markdown(
+        f"""
+        <div class="card-box">
+            <div class="card-title">{title}</div>
+            <div class="card-status">{emoji} {status_text}</div>
+            <div class="card-value">{value}</div>
+            <div class="card-sub">{sub_value}</div>
+            <div class="card-comment">{comment}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+@dataclass
+class SignalResult:
+    label: str
+    value: str
+    status: str
+    score: float
+    comment: str
+    detail: str = ""
+    importance: str = "Medium"
+
+
+# ------------------------------------------------------------
 # Sidebar
-# -----------------------------
+# ------------------------------------------------------------
 st.title("FRED + yfinance Entry Timing Dashboard")
 
 with st.sidebar:
@@ -338,7 +491,7 @@ with st.sidebar:
     oil_proxy = st.selectbox("Oil proxy", ["WTI", "Brent"], index=0)
     bond_proxy = st.selectbox("Bond proxy", ["TLT", "IEF"], index=0)
 
-    show_debug = st.checkbox("Show debug info", value=True)
+    show_debug = st.checkbox("Show debug expander", value=True)
 
     st.markdown("---")
     st.caption("Set FRED_API_KEY in environment variables or Streamlit secrets.")
@@ -348,9 +501,9 @@ if not fred_api_key:
     st.error("FRED_API_KEY not found. Please set it in environment variables or .streamlit/secrets.toml")
     st.stop()
 
-# -----------------------------
+# ------------------------------------------------------------
 # Data loading
-# -----------------------------
+# ------------------------------------------------------------
 start_date = (pd.Timestamp.today() - relativedelta(years=DEFAULT_LOOKBACK_YEARS + 5)).strftime("%Y-%m-%d")
 
 with st.spinner("Loading FRED data..."):
@@ -376,9 +529,9 @@ if yf_close.empty:
     st.error("No Yahoo Finance data loaded.")
     st.stop()
 
-# -----------------------------
-# Derived series
-# -----------------------------
+# ------------------------------------------------------------
+# Derived data
+# ------------------------------------------------------------
 cpi = resample_monthly_last(fred_data["CPI"])
 core_cpi = resample_monthly_last(fred_data["Core CPI"])
 unrate = resample_monthly_last(fred_data["Unemployment Rate"])
@@ -418,53 +571,26 @@ equity_series = qqq if target_equity == "QQQ" else spy
 equity_ma_fast = compute_dma(equity_series, price_ma_fast)
 equity_ma_slow = compute_dma(equity_series, price_ma_slow)
 
-# -----------------------------
-# Scoring helpers
-# -----------------------------
-def score_price_vs_ma(price_last: float, ma_last: float, neutral_band: float = 0.01) -> float:
-    if pd.isna(price_last) or pd.isna(ma_last) or ma_last == 0:
-        return 0.0
-    rel = price_last / ma_last - 1.0
-    if rel > neutral_band:
-        return 1.0
-    if rel >= -neutral_band:
-        return 0.5
-    return 0.0
-
-
-def score_slope(series: pd.Series, window: int = 20, flat_threshold_ratio: float = 0.0005) -> float:
-    s = series.dropna()
-    if len(s) < window:
-        return 0.0
-    slope = slope_value(s, window=window)
-    level = abs(s.iloc[-1])
-    if pd.isna(slope) or level == 0:
-        return 0.0
-    ratio = slope / level
-    if ratio > flat_threshold_ratio:
-        return 1.0
-    if ratio > -flat_threshold_ratio:
-        return 0.5
-    return 0.0
-
-
-# -----------------------------
-# Build signals
-# -----------------------------
+# ------------------------------------------------------------
+# Signals
+# ------------------------------------------------------------
 macro_signals: List[SignalResult] = []
 market_signals: List[SignalResult] = []
 
-# Macro 1: Oil pressure
+# Macro 1: Oil Pressure
 oil_len = len(oil_series.dropna())
+oil_last = safe_last(oil_series)
 oil_1m = pct_from_n_days(oil_series, 21)
 oil_3m = pct_from_n_days(oil_series, 63)
 
 if oil_len < 70 or pd.isna(oil_1m) or pd.isna(oil_3m):
     score = 0.5
-    comment = "Insufficient or unstable data; treated as neutral"
     value = "N/A"
+    detail = f"{oil_proxy} data unstable"
+    comment = "Insufficient or unstable data; treated as neutral"
 else:
-    value = f"1M {fmt_pct(oil_1m)} / 3M {fmt_pct(oil_3m)}"
+    value = f"{fmt_pct(oil_1m)}"
+    detail = f"Last {fmt_num(oil_last)} | 3M {fmt_pct(oil_3m)}"
     if oil_1m < -3 and oil_3m < 5:
         score = 1.0
         comment = "Oil pressure clearly cooling"
@@ -476,10 +602,10 @@ else:
         comment = "Oil still pressuring inflation"
 
 macro_signals.append(SignalResult(
-    "Oil Pressure", value, score_to_status(score), score, comment
+    "Oil Pressure", value, score_to_status(score), score, comment, detail, "High"
 ))
 
-# Macro 2: 10Y trend
+# Macro 2: 10Y Yield Trend
 y10_last = safe_last(y10)
 y10_1m_ago = safe_prev(y10, 21)
 if pd.notna(y10_last) and pd.notna(y10_1m_ago):
@@ -493,12 +619,14 @@ if pd.notna(y10_last) and pd.notna(y10_1m_ago):
     else:
         score = 0.0
         comment = "Discount rate still elevated"
+    detail = f"1M change {fmt_num(delta)}%p"
 else:
     score = 0.5
     comment = "Insufficient data"
+    detail = "No stable comparison"
 
 macro_signals.append(SignalResult(
-    "10Y Yield Trend", f"{fmt_num(y10_last)}%", score_to_status(score), score, comment
+    "10Y Yield", f"{fmt_num(y10_last)}%", score_to_status(score), score, comment, detail, "High"
 ))
 
 # Macro 3: Core CPI YoY
@@ -515,12 +643,14 @@ if pd.notna(core_last) and pd.notna(core_prev):
     else:
         score = 0.0
         comment = "Core inflation re-accelerating"
+    detail = f"Prev {fmt_pct(core_prev)} | MoM delta {fmt_num(diff)}"
 else:
     score = 0.5
     comment = "Insufficient data"
+    detail = "No stable comparison"
 
 macro_signals.append(SignalResult(
-    "Core CPI YoY", fmt_pct(core_last), score_to_status(score), score, comment
+    "Core CPI YoY", fmt_pct(core_last), score_to_status(score), score, comment, detail, "Medium"
 ))
 
 # Macro 4: Unemployment
@@ -537,15 +667,17 @@ if pd.notna(un_last) and pd.notna(un_3m_ago):
     else:
         score = 0.0
         comment = "Labor market weakening fast"
+    detail = f"3M delta {fmt_num(delta)}"
 else:
     score = 0.5
     comment = "Insufficient data"
+    detail = "No stable comparison"
 
 macro_signals.append(SignalResult(
-    "Unemployment", fmt_num(un_last), score_to_status(score), score, comment
+    "Unemployment", fmt_num(un_last), score_to_status(score), score, comment, detail, "Medium"
 ))
 
-# Macro 5: 10Y-2Y curve
+# Macro 5: Yield Curve
 yc_last = safe_last(yc_10y_2y)
 yc_1m_ago = safe_prev(yc_10y_2y, 21)
 if pd.notna(yc_last) and pd.notna(yc_1m_ago):
@@ -559,60 +691,74 @@ if pd.notna(yc_last) and pd.notna(yc_1m_ago):
     else:
         score = 0.0
         comment = "Curve not improving"
+    detail = f"1M delta {fmt_num(delta)}"
 else:
     score = 0.5
     comment = "Insufficient data"
+    detail = "No stable comparison"
 
 macro_signals.append(SignalResult(
-    "10Y-2Y Curve", fmt_num(yc_last), score_to_status(score), score, comment
+    "10Y-2Y Curve", fmt_num(yc_last), score_to_status(score), score, comment, detail, "Medium"
 ))
 
 # Market 1: equity > fast MA
 eq_last = safe_last(equity_series)
 eq_ma_fast_last = safe_last(equity_ma_fast)
 score = score_price_vs_ma(eq_last, eq_ma_fast_last, neutral_band=0.01)
+gap_fast = (eq_last / eq_ma_fast_last - 1.0) * 100.0 if pd.notna(eq_last) and pd.notna(eq_ma_fast_last) and eq_ma_fast_last != 0 else np.nan
 comment = "Above fast trend" if score == 1.0 else ("Near fast trend" if score == 0.5 else "Still below fast trend")
+detail = f"Current {fmt_num(eq_last)} vs {price_ma_fast}DMA {fmt_num(eq_ma_fast_last)} | Gap {fmt_pct(gap_fast)}"
 market_signals.append(SignalResult(
-    f"{target_equity} > {price_ma_fast}DMA", fmt_num(eq_last), score_to_status(score), score, comment
+    f"{target_equity} > {price_ma_fast}DMA", fmt_num(eq_last), score_to_status(score), score, comment, detail, "High"
 ))
 
 # Market 2: equity > slow MA
 eq_ma_slow_last = safe_last(equity_ma_slow)
 score = score_price_vs_ma(eq_last, eq_ma_slow_last, neutral_band=0.02)
+gap_slow = (eq_last / eq_ma_slow_last - 1.0) * 100.0 if pd.notna(eq_last) and pd.notna(eq_ma_slow_last) and eq_ma_slow_last != 0 else np.nan
 comment = "Long trend confirmed" if score == 1.0 else ("Near long trend" if score == 0.5 else "Long trend not confirmed")
+detail = f"Current {fmt_num(eq_last)} vs {price_ma_slow}DMA {fmt_num(eq_ma_slow_last)} | Gap {fmt_pct(gap_slow)}"
 market_signals.append(SignalResult(
-    f"{target_equity} > {price_ma_slow}DMA", fmt_num(eq_last), score_to_status(score), score, comment
+    f"{target_equity} > {price_ma_slow}DMA", fmt_num(eq_last), score_to_status(score), score, comment, detail, "High"
 ))
 
-# Market 3: Higher low
+# Market 3: Higher Low
 hl = higher_low_signal(equity_series, lookback=120)
 score = 1.0 if hl == 2 else (0.5 if hl == 1 else 0.0)
 comment = "Base-building structure" if score == 1.0 else ("Weak higher-low attempt" if score == 0.5 else "No base structure yet")
+detail = "Structure over recent 120 trading days"
 market_signals.append(SignalResult(
-    "Higher Low", "True" if hl > 0 else "False", score_to_status(score), score, comment
+    "Higher Low", "True" if hl > 0 else "False", score_to_status(score), score, comment, detail, "High"
 ))
 
-# Market 4: HYG
+# Market 4: HYG trend
+hyg_last = safe_last(hyg)
+hyg_slope = slope_value(hyg, 20)
 score = score_slope(hyg, window=20, flat_threshold_ratio=0.0005)
 comment = "Credit market supportive" if score == 1.0 else ("Credit market stabilizing" if score == 0.5 else "Credit market not supportive")
+detail = f"Last {fmt_num(hyg_last)} | 20d slope {fmt_num(hyg_slope, 6)}"
 market_signals.append(SignalResult(
-    "HYG Trend", fmt_num(safe_last(hyg)), score_to_status(score), score, comment
+    "HYG Trend", fmt_num(hyg_last), score_to_status(score), score, comment, detail, "Medium"
 ))
 
-# Market 5: Bond proxy
+# Market 5: Bond trend
+bond_last = safe_last(bond_series)
+bond_slope = slope_value(bond_series, 20)
 score = score_slope(bond_series, window=20, flat_threshold_ratio=0.0005)
 comment = "Bond market confirms easing" if score == 1.0 else ("Bond market stabilizing" if score == 0.5 else "Bond market not confirming easing")
+detail = f"Last {fmt_num(bond_last)} | 20d slope {fmt_num(bond_slope, 6)}"
 market_signals.append(SignalResult(
-    f"{bond_proxy} Trend", fmt_num(safe_last(bond_series)), score_to_status(score), score, comment
+    f"{bond_proxy} Trend", fmt_num(bond_last), score_to_status(score), score, comment, detail, "Medium"
 ))
 
-macro_score = sum(x.score for x in macro_signals)
-market_score = sum(x.score for x in market_signals)
+macro_score = float(sum(x.score for x in macro_signals))
+market_score = float(sum(x.score for x in market_signals))
 total_score = macro_score + market_score
+entry_readiness = readiness_percent(total_score, 10.0)
 
-# -----------------------------
-# Regime
-# -----------------------------
+# ------------------------------------------------------------
+# Regime classification
+# ------------------------------------------------------------
 if total_score <= 3.0:
     risk_environment = "Risk-Off"
     trend_status = "Downtrend / Fragile"
@@ -634,45 +780,118 @@ else:
     entry_mode = "AGGRESSIVE BUY"
     entry_comment = f"Trend and macro aligned. Full staged allocation possible: {starter_allocation + add_allocation + final_allocation}%."
 
-# -----------------------------
-# Header
-# -----------------------------
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Macro Score", f"{macro_score:.1f}/5")
-m2.metric("Market Score", f"{market_score:.1f}/5")
-m3.metric("Total Score", f"{total_score:.1f}/10")
-m4.metric("Risk Environment", risk_environment)
-m5.metric("Entry Mode", entry_mode)
-st.caption(entry_comment)
+# ------------------------------------------------------------
+# Why low / What next
+# ------------------------------------------------------------
+def build_why_low(signals: List[SignalResult], max_items: int = 4) -> List[str]:
+    items = []
+    for s in signals:
+        if s.score == 0.0:
+            items.append(f"**{s.label}** — {s.comment}")
+    return items[:max_items]
 
-# -----------------------------
+
+def build_watch_next(signals: List[SignalResult], max_items: int = 4) -> List[str]:
+    mapping = {
+        "Oil Pressure": "Oil momentum cooling further",
+        "10Y Yield": "10Y yield trending lower",
+        "Core CPI YoY": "Core CPI continuing to cool",
+        "Unemployment": "Labor softening without sharp spike",
+        "10Y-2Y Curve": "Yield curve steepening meaningfully",
+        f"{target_equity} > {price_ma_fast}DMA": f"{target_equity} reclaiming {price_ma_fast}DMA",
+        f"{target_equity} > {price_ma_slow}DMA": f"{target_equity} reclaiming {price_ma_slow}DMA",
+        "Higher Low": "Higher low structure forming",
+        "HYG Trend": "Credit market stabilizing",
+        f"{bond_proxy} Trend": f"{bond_proxy} confirming easing",
+    }
+    items = []
+    for s in signals:
+        if s.score < 1.0:
+            items.append(f"**{s.label}** — {mapping.get(s.label, 'Needs improvement')}")
+    return items[:max_items]
+
+
+why_low = build_why_low(macro_signals + market_signals, 6)
+watch_next = build_watch_next(macro_signals + market_signals, 6)
+
+# ------------------------------------------------------------
+# Top summary
+# ------------------------------------------------------------
+st.markdown('<div class="section-title">Top Summary</div>', unsafe_allow_html=True)
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    render_summary_box("Risk Environment", risk_environment, f"Macro score {macro_score:.1f}/5")
+with c2:
+    render_summary_box("Trend Status", trend_status, f"Market score {market_score:.1f}/5")
+with c3:
+    render_summary_box("Entry Mode", entry_mode, entry_comment)
+with c4:
+    render_summary_box("Entry Readiness", f"{entry_readiness}%", f"Total score {total_score:.1f}/10")
+
+st.caption("FRED = macro filter, yfinance = execution timing. Use the summary first, then inspect the signals.")
+
+# ------------------------------------------------------------
 # Tabs
-# -----------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Market Snapshot",
-    "Macro Scorecard",
-    "Signal Charts",
-    "Trend Confirmation",
-    "Regime & Entry Plan",
+# ------------------------------------------------------------
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Signal Overview",
+    "Charts",
+    "Detailed Data",
     "Debug"
 ])
 
-# ============================================================
-# TAB 1
-# ============================================================
+# ------------------------------------------------------------
+# Tab 1: Signal Overview
+# ------------------------------------------------------------
 with tab1:
-    st.subheader("Market Snapshot")
+    st.markdown('<div class="section-title">Macro Conditions</div>', unsafe_allow_html=True)
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    for col, sig in zip([mc1, mc2, mc3, mc4, mc5], macro_signals):
+        with col:
+            render_signal_card(sig.label, sig.status, sig.value, sig.detail, sig.comment)
+
+    st.markdown('<div class="section-title">Market Conditions</div>', unsafe_allow_html=True)
+    mk1, mk2, mk3, mk4, mk5 = st.columns(5)
+    for col, sig in zip([mk1, mk2, mk3, mk4, mk5], market_signals):
+        with col:
+            render_signal_card(sig.label, sig.status, sig.value, sig.detail, sig.comment)
+
+    st.markdown('<div class="section-title">Why current score is low / What to watch next</div>', unsafe_allow_html=True)
+    wl, wn = st.columns(2)
+
+    with wl:
+        st.markdown('<div class="list-box">', unsafe_allow_html=True)
+        st.markdown("#### Why current score is low")
+        if why_low:
+            for item in why_low:
+                st.markdown(f"- {item}")
+        else:
+            st.markdown("- No major weak spot detected.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with wn:
+        st.markdown('<div class="list-box">', unsafe_allow_html=True)
+        st.markdown("#### What to watch next")
+        if watch_next:
+            for item in watch_next:
+                st.markdown(f"- {item}")
+        else:
+            st.markdown("- No major improvement required.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ------------------------------------------------------------
+# Tab 2: Charts
+# ------------------------------------------------------------
+with tab2:
+    st.markdown('<div class="section-title">Market Snapshot</div>', unsafe_allow_html=True)
 
     snapshot_assets = {
         "SPY": spy,
         "QQQ": qqq,
         "IWM": iwm,
         "HYG": hyg,
-        "TLT": tlt,
-        "IEF": ief,
-        "GLD": gld,
-        "XLE": xle,
-        "UUP": uup,
+        bond_proxy: bond_series,
         oil_proxy: oil_series,
         "SOXX": soxx,
     }
@@ -691,7 +910,6 @@ with tab1:
             "1Y %": pct_from_n_days(s, 252),
             "Drawdown %": rolling_max_drawdown(s),
         })
-
     snap_df = pd.DataFrame(rows)
     st.dataframe(
         snap_df.style.format({
@@ -715,76 +933,14 @@ with tab1:
         oil_proxy: slice_lookback(oil_series, lookback_label),
     }).dropna(how="all")
 
-    fig = make_line_chart(chart_df, f"Normalized Multi-Asset Snapshot ({lookback_label})", "Indexed to 100", normalize=True)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ============================================================
-# TAB 2
-# ============================================================
-with tab2:
-    st.subheader("Macro Scorecard")
-
-    macro_table = pd.DataFrame([{
-        "Signal": s.label,
-        "Value": s.value,
-        "Status": status_emoji(s.status),
-        "Score": s.score,
-        "Comment": s.comment
-    } for s in macro_signals])
-
-    market_table = pd.DataFrame([{
-        "Signal": s.label,
-        "Value": s.value,
-        "Status": status_emoji(s.status),
-        "Score": s.score,
-        "Comment": s.comment
-    } for s in market_signals])
-
-    c1, c2 = st.columns(2)
-
-    with c1:
-        st.markdown("#### Macro Signals")
-        st.dataframe(macro_table, use_container_width=True, hide_index=True)
-        st.plotly_chart(
-            make_bar_score_chart({s.label: s.score for s in macro_signals}, "Macro Signal Scores"),
-            use_container_width=True
-        )
-
-    with c2:
-        st.markdown("#### Market Signals")
-        st.dataframe(market_table, use_container_width=True, hide_index=True)
-        st.plotly_chart(
-            make_bar_score_chart({s.label: s.score for s in market_signals}, "Market Signal Scores"),
-            use_container_width=True
-        )
-
-    st.markdown("#### Macro Data Snapshot")
-    macro_snapshot = pd.DataFrame([
-        {"Series": "CPI YoY", "Last": safe_last(cpi_yoy), "Prev": safe_prev(cpi_yoy, 1)},
-        {"Series": "Core CPI YoY", "Last": safe_last(core_cpi_yoy), "Prev": safe_prev(core_cpi_yoy, 1)},
-        {"Series": "Unemployment Rate", "Last": safe_last(unrate), "Prev": safe_prev(unrate, 1)},
-        {"Series": "Initial Claims", "Last": safe_last(claims), "Prev": safe_prev(claims, 1)},
-        {"Series": "Industrial Production YoY", "Last": safe_last(indpro_yoy), "Prev": safe_prev(indpro_yoy, 1)},
-        {"Series": "M2 YoY", "Last": safe_last(m2_yoy), "Prev": safe_prev(m2_yoy, 1)},
-        {"Series": "10Y Yield", "Last": safe_last(y10), "Prev": safe_prev(y10, 21)},
-        {"Series": "2Y Yield", "Last": safe_last(y2), "Prev": safe_prev(y2, 21)},
-        {"Series": "10Y-2Y", "Last": safe_last(yc_10y_2y), "Prev": safe_prev(yc_10y_2y, 21)},
-    ])
-    st.dataframe(
-        macro_snapshot.style.format({"Last": "{:,.2f}", "Prev": "{:,.2f}"}),
-        use_container_width=True,
-        hide_index=True
+    st.plotly_chart(
+        make_line_chart(chart_df, f"Normalized Multi-Asset Snapshot ({lookback_label})", "Indexed to 100", normalize=True),
+        use_container_width=True
     )
 
-# ============================================================
-# TAB 3
-# ============================================================
-with tab3:
-    st.subheader("Signal Charts")
+    c_left, c_right = st.columns(2)
 
-    c1, c2 = st.columns(2)
-
-    with c1:
+    with c_left:
         infl_df = pd.concat([
             slice_lookback(cpi_yoy.rename("CPI YoY"), lookback_label),
             slice_lookback(core_cpi_yoy.rename("Core CPI YoY"), lookback_label),
@@ -797,7 +953,7 @@ with tab3:
         ], axis=1).dropna(how="all")
         st.plotly_chart(make_line_chart(yc_df, f"Yield Curve ({lookback_label})", "%p"), use_container_width=True)
 
-    with c2:
+    with c_right:
         rates_df = pd.concat([
             slice_lookback(y10.rename("10Y"), lookback_label),
             slice_lookback(y2.rename("2Y"), lookback_label),
@@ -812,12 +968,7 @@ with tab3:
         ], axis=1).dropna(how="all")
         st.plotly_chart(make_line_chart(growth_df, f"Growth / Liquidity ({lookback_label})", "%"), use_container_width=True)
 
-# ============================================================
-# TAB 4
-# ============================================================
-with tab4:
-    st.subheader("Trend Confirmation")
-
+    st.markdown('<div class="section-title">Trend Confirmation</div>', unsafe_allow_html=True)
     trend_price = slice_lookback(equity_series, lookback_label)
     trend_fast = slice_lookback(equity_ma_fast, lookback_label)
     trend_slow = slice_lookback(equity_ma_slow, lookback_label)
@@ -828,7 +979,7 @@ with tab4:
     fig.add_trace(go.Scatter(x=trend_slow.index, y=trend_slow, mode="lines", name=f"{price_ma_slow}DMA"))
     fig.update_layout(
         title=f"{target_equity} Trend Confirmation ({lookback_label})",
-        height=500,
+        height=480,
         xaxis_title="Date",
         yaxis_title="Price",
         hovermode="x unified",
@@ -836,95 +987,79 @@ with tab4:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"{target_equity} Last", fmt_num(safe_last(equity_series)))
-    c2.metric(f"{price_ma_fast}DMA", fmt_num(safe_last(equity_ma_fast)))
-    c3.metric(f"{price_ma_slow}DMA", fmt_num(safe_last(equity_ma_slow)))
-    hl = higher_low_signal(equity_series)
-    c4.metric("Higher Low", "Strong" if hl == 2 else ("Weak" if hl == 1 else "No"))
+# ------------------------------------------------------------
+# Tab 3: Detailed Data
+# ------------------------------------------------------------
+with tab3:
+    st.markdown('<div class="section-title">Detailed Signal Table</div>', unsafe_allow_html=True)
 
-    st.markdown("#### Risk-On Confirmation Basket")
-    basket = pd.concat([
-        slice_lookback(spy.rename("SPY"), lookback_label),
-        slice_lookback(qqq.rename("QQQ"), lookback_label),
-        slice_lookback(iwm.rename("IWM"), lookback_label),
-        slice_lookback(hyg.rename("HYG"), lookback_label),
-        slice_lookback(bond_series.rename(bond_proxy), lookback_label),
-        slice_lookback(soxx.rename("SOXX"), lookback_label),
-    ], axis=1).dropna(how="all")
-
-    st.plotly_chart(make_line_chart(basket, f"Risk-On Basket ({lookback_label})", "Indexed to 100", normalize=True), use_container_width=True)
-
-# ============================================================
-# TAB 5
-# ============================================================
-with tab5:
-    st.subheader("Regime & Entry Plan")
-
-    c1, c2 = st.columns([1, 1])
-
-    with c1:
-        regime_df = pd.DataFrame([
-            {"Item": "Risk Environment", "Value": risk_environment},
-            {"Item": "Trend Status", "Value": trend_status},
-            {"Item": "Entry Mode", "Value": entry_mode},
-            {"Item": "Macro Score", "Value": f"{macro_score:.1f}/5"},
-            {"Item": "Market Score", "Value": f"{market_score:.1f}/5"},
-            {"Item": "Total Score", "Value": f"{total_score:.1f}/10"},
-        ])
-        st.markdown("#### Current Regime")
-        st.dataframe(regime_df, use_container_width=True, hide_index=True)
-
-        alloc_df = pd.DataFrame([
-            {"Step": "Starter Buy", "Allocation %": starter_allocation, "Condition": "Macro stabilizing, early confirmation"},
-            {"Step": "Add", "Allocation %": add_allocation, "Condition": "Trend confirmed, price near/above MA, supportive credit/bonds"},
-            {"Step": "Final Add", "Allocation %": final_allocation, "Condition": "Price above slow MA, pullback holds, regime improving"},
-        ])
-        st.markdown("#### Suggested Allocation Plan")
-        st.dataframe(alloc_df, use_container_width=True, hide_index=True)
-
-    with c2:
-        rules = pd.DataFrame([
-            {"Score Range": "0.0-3.0", "Mode": "WAIT", "Interpretation": "Risk-off. Preserve cash and observe."},
-            {"Score Range": "3.5-5.0", "Mode": "STARTER BUY", "Interpretation": "Base building. Small initial entry only."},
-            {"Score Range": "5.5-7.5", "Mode": "ADD", "Interpretation": "Trend confirmation improving. Add in stages."},
-            {"Score Range": "8.0-10.0", "Mode": "AGGRESSIVE BUY", "Interpretation": "Macro + market aligned. Full staged plan allowed."},
-        ])
-        st.markdown("#### Decision Rules")
-        st.dataframe(rules, use_container_width=True, hide_index=True)
-
-        st.markdown("#### Live Interpretation")
-        st.info(entry_comment)
-
-    st.markdown("#### Raw Signal Summary")
     raw_all = pd.DataFrame([{
         "Category": "Macro",
         "Signal": s.label,
         "Value": s.value,
         "Status": s.status,
         "Score": s.score,
-        "Comment": s.comment
+        "Importance": s.importance,
+        "Detail": s.detail,
+        "Comment": s.comment,
     } for s in macro_signals] + [{
         "Category": "Market",
         "Signal": s.label,
         "Value": s.value,
         "Status": s.status,
         "Score": s.score,
-        "Comment": s.comment
+        "Importance": s.importance,
+        "Detail": s.detail,
+        "Comment": s.comment,
     } for s in market_signals])
 
     st.dataframe(raw_all, use_container_width=True, hide_index=True)
 
-# ============================================================
-# TAB 6
-# ============================================================
-with tab6:
-    st.subheader("Debug")
+    with st.expander("Macro data snapshot", expanded=False):
+        macro_snapshot = pd.DataFrame([
+            {"Series": "CPI YoY", "Last": safe_last(cpi_yoy), "Prev": safe_prev(cpi_yoy, 1)},
+            {"Series": "Core CPI YoY", "Last": safe_last(core_cpi_yoy), "Prev": safe_prev(core_cpi_yoy, 1)},
+            {"Series": "Unemployment Rate", "Last": safe_last(unrate), "Prev": safe_prev(unrate, 1)},
+            {"Series": "Initial Claims", "Last": safe_last(claims), "Prev": safe_prev(claims, 1)},
+            {"Series": "Industrial Production YoY", "Last": safe_last(indpro_yoy), "Prev": safe_prev(indpro_yoy, 1)},
+            {"Series": "M2 YoY", "Last": safe_last(m2_yoy), "Prev": safe_prev(m2_yoy, 1)},
+            {"Series": "10Y Yield", "Last": safe_last(y10), "Prev": safe_prev(y10, 21)},
+            {"Series": "2Y Yield", "Last": safe_last(y2), "Prev": safe_prev(y2, 21)},
+            {"Series": "10Y-2Y", "Last": safe_last(yc_10y_2y), "Prev": safe_prev(yc_10y_2y, 21)},
+        ])
+        st.dataframe(
+            macro_snapshot.style.format({"Last": "{:,.2f}", "Prev": "{:,.2f}"}),
+            use_container_width=True,
+            hide_index=True
+        )
 
+    with st.expander("Suggested allocation plan", expanded=False):
+        alloc_df = pd.DataFrame([
+            {"Step": "Starter Buy", "Allocation %": starter_allocation, "Condition": "Macro stabilizing, early confirmation"},
+            {"Step": "Add", "Allocation %": add_allocation, "Condition": "Trend confirmed, price near/above MA, supportive credit/bonds"},
+            {"Step": "Final Add", "Allocation %": final_allocation, "Condition": "Price above slow MA, pullback holds, regime improving"},
+        ])
+        st.dataframe(alloc_df, use_container_width=True, hide_index=True)
+
+    with st.expander("Decision rules", expanded=False):
+        rules = pd.DataFrame([
+            {"Score Range": "0.0-3.0", "Mode": "WAIT", "Interpretation": "Risk-off. Preserve cash and observe."},
+            {"Score Range": "3.5-5.0", "Mode": "STARTER BUY", "Interpretation": "Base building. Small initial entry only."},
+            {"Score Range": "5.5-7.5", "Mode": "ADD", "Interpretation": "Trend confirmation improving. Add in stages."},
+            {"Score Range": "8.0-10.0", "Mode": "AGGRESSIVE BUY", "Interpretation": "Macro + market aligned. Full staged plan allowed."},
+        ])
+        st.dataframe(rules, use_container_width=True, hide_index=True)
+
+# ------------------------------------------------------------
+# Tab 4: Debug
+# ------------------------------------------------------------
+with tab4:
     if show_debug:
-        c1, c2 = st.columns(2)
+        st.markdown('<div class="section-title">Debug</div>', unsafe_allow_html=True)
 
-        with c1:
+        d1, d2 = st.columns(2)
+
+        with d1:
             st.markdown("#### Oil Debug")
             oil_debug_df = pd.DataFrame({
                 "Metric": [
@@ -938,7 +1073,7 @@ with tab6:
                 "Value": [
                     oil_proxy,
                     oil_len,
-                    fmt_num(safe_last(oil_series)),
+                    fmt_num(oil_last),
                     fmt_pct(oil_1m),
                     fmt_pct(oil_3m),
                     str(oil_series.dropna().index[-1].date()) if oil_len > 0 else "N/A",
@@ -948,13 +1083,15 @@ with tab6:
             st.write("Oil last 10 rows")
             st.dataframe(oil_series.tail(10).to_frame(name=oil_proxy), use_container_width=True)
 
-        with c2:
+        with d2:
             st.markdown("#### Trend Debug")
             trend_debug_df = pd.DataFrame({
                 "Metric": [
                     f"{target_equity} Last",
                     f"{target_equity} {price_ma_fast}DMA",
                     f"{target_equity} {price_ma_slow}DMA",
+                    "Fast MA Gap %",
+                    "Slow MA Gap %",
                     "HYG Slope(20d)",
                     f"{bond_proxy} Slope(20d)",
                     "Higher Low Signal",
@@ -963,8 +1100,10 @@ with tab6:
                     fmt_num(eq_last),
                     fmt_num(eq_ma_fast_last),
                     fmt_num(eq_ma_slow_last),
-                    fmt_num(slope_value(hyg, 20), 6),
-                    fmt_num(slope_value(bond_series, 20), 6),
+                    fmt_pct(gap_fast),
+                    fmt_pct(gap_slow),
+                    fmt_num(hyg_slope, 6),
+                    fmt_num(bond_slope, 6),
                     "Strong" if hl == 2 else ("Weak" if hl == 1 else "No"),
                 ]
             })
@@ -974,7 +1113,7 @@ with tab6:
             st.write(f"Recent {bond_proxy}")
             st.dataframe(bond_series.tail(10).to_frame(name=bond_proxy), use_container_width=True)
     else:
-        st.info("Enable 'Show debug info' in the sidebar.")
+        st.info("Enable 'Show debug expander' in the sidebar.")
 
 st.markdown("---")
-st.caption("Framework: FRED for macro regime filtering + yfinance for execution timing.")
+st.caption("This dashboard is a decision-support tool for macro regime filtering and entry timing.")
