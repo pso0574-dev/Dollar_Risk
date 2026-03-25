@@ -5,3 +5,4 @@ plotly
 yfinance
 requests
 python-dateutil
+scikit-learn>=1.3.0
